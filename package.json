@@ -1,0 +1,15 @@
+{
+  "name": "yh-auth-server",
+  "version": "1.0.0",
+  "description": "Custom high-performance License Authentication Server for YH Macro",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": ["license", "auth", "hwid", "yh-macro"],
+  "author": "YH Software",
+  "license": "Proprietary"
+}
