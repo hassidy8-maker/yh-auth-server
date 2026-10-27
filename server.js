@@ -23,7 +23,7 @@ function signLicense(key, machineId, expiresAt) {
 }
 
 // Initialize SQLite database
-const DB_PATH = path.join(__dirname, "licenses.db");
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, "licenses.db");
 const db = new DatabaseSync(DB_PATH);
 
 // Setup schema
@@ -328,7 +328,8 @@ const server = http.createServer(async (req, res) => {
 
       const duration = body.duration || "Lifetime";
       const key = (body.key || generateLicenseKey(duration)).trim().toUpperCase();
-      const expiresAt = computeExpiresAt(duration);
+      // Expiration countdown starts ONLY upon first activation on the user's machine, not on generation
+      const expiresAt = body.expires_at || null;
       const createdAt = new Date().toISOString();
       const permissions = JSON.stringify(body.permissions || {});
 
@@ -860,7 +861,9 @@ function getAdminDashboardHtml() {
         const isExp = item.expires_at && new Date() > new Date(item.expires_at);
         const statusBadge = (!item.is_active || isExp) 
           ? '<span class="badge badge-expired">Expired</span>'
-          : '<span class="badge badge-active">Active</span>';
+          : (!item.machine_id 
+              ? '<span class="badge" style="background: rgba(0, 240, 255, 0.15); color: #00f0ff; border: 1px solid rgba(0, 240, 255, 0.3);">Ready</span>' 
+              : '<span class="badge badge-active">Active</span>');
 
         const hwidDisplay = item.machine_id 
           ? '<span class="hwid-tag">' + item.machine_id.substring(0, 16) + '...</span>'
@@ -868,7 +871,7 @@ function getAdminDashboardHtml() {
 
         const expDisplay = item.expires_at 
           ? new Date(item.expires_at).toLocaleDateString() + ' ' + new Date(item.expires_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
-          : 'Never (Lifetime)';
+          : (item.duration === "Lifetime" ? "Never (Lifetime)" : "Unused (Starts on activation)");
 
         return '<tr>' +
           '<td><span class="mono">' + item.key + '</span></td>' +
