@@ -22,27 +22,133 @@ function signLicense(key, machineId, expiresAt) {
   return hmac.digest("hex");
 }
 
-// Initialize SQLite database
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "licenses.db");
-const db = new DatabaseSync(DB_PATH);
+// Database connection (Turso Cloud SQLite with local node:sqlite fallback)
+const TURSO_URL = process.env.TURSO_DATABASE_URL || "libsql://yh-mc-hassidy8-maker.aws-eu-central-1.turso.io";
+const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN || "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTMxMjk5MTksImlkIjoiMDFhMTdlZGMtMDAwMS03MDUzLTgzZDgtMzE2Yzc1NmU4YTk5Iiwia2lkIjoiZ2VoMXdLUWhyU21OeEtjV29HQnNselpsQzJHYm9rTUhLRTN6aFFYMWQtcyIsInJpZCI6ImZjZDU2OTAxLWE1MmUtNGU0Ny05MjYzLTI5NjZkNmQ3NjRmYiJ9.JQq4ZJeke51IzL6YCqrD2NwcQO4ZcqpDCouiq2vdtumrou91wcGVPbszq6YSQkgsU0shbJPWnoCq2p1s4BQAAw";
 
-// Setup schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS licenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    key TEXT UNIQUE NOT NULL,
-    duration TEXT NOT NULL,
-    activated_at TEXT,
-    expires_at TEXT,
-    machine_id TEXT,
-    is_active INTEGER DEFAULT 1,
-    created_at TEXT NOT NULL,
-    permissions TEXT DEFAULT '{}'
-  );
-  CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key);
-`);
+let db;
 
-console.log(`[YH AUTH] Database connected: ${DB_PATH}`);
+function mapArg(arg) {
+  if (arg === null || arg === undefined) return { type: "null" };
+  if (typeof arg === "number") {
+    return Number.isInteger(arg) ? { type: "integer", value: String(arg) } : { type: "float", value: arg };
+  }
+  if (typeof arg === "boolean") return { type: "integer", value: arg ? "1" : "0" };
+  return { type: "text", value: String(arg) };
+}
+
+if (TURSO_URL && TURSO_TOKEN) {
+  const tursoEndpoint = TURSO_URL.replace(/^libsql:\/\//i, "https://").replace(/\/$/, "") + "/v2/pipeline";
+
+  async function tursoExec(sql, args = []) {
+    const hranaArgs = args.map(mapArg);
+    const res = await fetch(tursoEndpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${TURSO_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        requests: [
+          { type: "execute", stmt: { sql, args: hranaArgs } },
+          { type: "close" },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Turso HTTP ${res.status}: ${errText}`);
+    }
+
+    const json = await res.json();
+    const firstResult = json.results?.[0];
+    if (!firstResult || firstResult.type === "error") {
+      throw new Error(firstResult?.error?.message || "Turso query execution failed");
+    }
+
+    const result = firstResult.response.result;
+    const cols = (result.cols || []).map((c) => c.name);
+    const rows = (result.rows || []).map((row) => {
+      const item = {};
+      cols.forEach((col, i) => {
+        const cell = row[i];
+        if (!cell || cell.type === "null") item[col] = null;
+        else if (cell.type === "integer") item[col] = parseInt(cell.value, 10);
+        else if (cell.type === "float") item[col] = cell.value;
+        else item[col] = cell.value;
+      });
+      return item;
+    });
+
+    return { rows, changes: result.affected_row_count || 0 };
+  }
+
+  db = {
+    async query(sql, ...args) {
+      const res = await tursoExec(sql, args);
+      return res.rows;
+    },
+    async get(sql, ...args) {
+      const res = await tursoExec(sql, args);
+      return res.rows[0] || null;
+    },
+    async run(sql, ...args) {
+      return await tursoExec(sql, args);
+    },
+    async exec(sql) {
+      const stmts = sql.split(";").map((s) => s.trim()).filter(Boolean);
+      for (const s of stmts) {
+        await tursoExec(s, []);
+      }
+    },
+  };
+  console.log(`[YH AUTH] Connected to Turso Cloud SQLite: ${TURSO_URL}`);
+} else {
+  const { DatabaseSync } = require("node:sqlite");
+  const DB_PATH = process.env.DB_PATH || path.join(__dirname, "licenses.db");
+  const localDb = new DatabaseSync(DB_PATH);
+
+  db = {
+    async query(sql, ...args) {
+      return localDb.prepare(sql).all(...args);
+    },
+    async get(sql, ...args) {
+      return localDb.prepare(sql).get(...args) || null;
+    },
+    async run(sql, ...args) {
+      const info = localDb.prepare(sql).run(...args);
+      return { changes: info.changes };
+    },
+    async exec(sql) {
+      localDb.exec(sql);
+    },
+  };
+  console.log(`[YH AUTH] Connected to Local SQLite database: ${DB_PATH}`);
+}
+
+async function initDb() {
+  try {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS licenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT UNIQUE NOT NULL,
+        duration TEXT NOT NULL,
+        activated_at TEXT,
+        expires_at TEXT,
+        machine_id TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL,
+        permissions TEXT DEFAULT '{}'
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key)`);
+    console.log("[YH AUTH] Database schema ready.");
+  } catch (err) {
+    console.error("[YH AUTH] Database init error:", err.message);
+  }
+}
+initDb().catch(console.error);
 
 // Helper: Duration to expiration date from now
 function computeExpiresAt(duration) {
@@ -182,8 +288,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const stmt = db.prepare("SELECT * FROM licenses WHERE key = ?");
-      const record = stmt.get(rawKey);
+      const record = await db.get("SELECT * FROM licenses WHERE key = ?", rawKey);
 
       if (!record) {
         return sendJson(res, 404, { valid: false, message: "License key not found" });
@@ -197,7 +302,7 @@ const server = http.createServer(async (req, res) => {
       if (record.expires_at) {
         const expiresAt = new Date(record.expires_at);
         if (new Date() > expiresAt) {
-          db.prepare("UPDATE licenses SET is_active = 0 WHERE id = ?").run(record.id);
+          await db.run("UPDATE licenses SET is_active = 0 WHERE id = ?", record.id);
           return sendJson(res, 403, { valid: false, message: "License key has expired" });
         }
       }
@@ -216,11 +321,11 @@ const server = http.createServer(async (req, res) => {
           finalExpiresAt = computeExpiresAt(record.duration);
         }
 
-        db.prepare(`
+        await db.run(`
           UPDATE licenses 
           SET machine_id = ?, activated_at = COALESCE(activated_at, ?), expires_at = ?
           WHERE id = ?
-        `).run(updatedMachineId, now, finalExpiresAt, record.id);
+        `, updatedMachineId, now, finalExpiresAt, record.id);
 
         record.machine_id = updatedMachineId;
         record.activated_at = record.activated_at || now;
@@ -280,7 +385,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const record = db.prepare("SELECT * FROM licenses WHERE key = ?").get(rawKey);
+      const record = await db.get("SELECT * FROM licenses WHERE key = ?", rawKey);
 
       if (!record || !record.is_active) {
         return sendJson(res, 404, { valid: false, is_active: false, message: "License invalid or revoked" });
@@ -289,7 +394,7 @@ const server = http.createServer(async (req, res) => {
       if (record.expires_at) {
         const expiresAt = new Date(record.expires_at);
         if (new Date() > expiresAt) {
-          db.prepare("UPDATE licenses SET is_active = 0 WHERE id = ?").run(record.id);
+          await db.run("UPDATE licenses SET is_active = 0 WHERE id = ?", record.id);
           return sendJson(res, 403, { valid: false, is_active: false, message: "License expired" });
         }
       }
@@ -334,10 +439,10 @@ const server = http.createServer(async (req, res) => {
       const permissions = JSON.stringify(body.permissions || {});
 
       try {
-        db.prepare(`
+        await db.run(`
           INSERT INTO licenses (key, duration, expires_at, created_at, permissions, is_active)
           VALUES (?, ?, ?, ?, ?, 1)
-        `).run(key, duration, expiresAt, createdAt, permissions);
+        `, key, duration, expiresAt, createdAt, permissions);
 
         return sendJson(res, 201, {
           success: true,
@@ -365,7 +470,7 @@ const server = http.createServer(async (req, res) => {
       const key = (body.key || "").trim().toUpperCase();
       if (!key) return sendJson(res, 400, { error: "Key is required" });
 
-      const info = db.prepare("UPDATE licenses SET machine_id = NULL WHERE key = ?").run(key);
+      const info = await db.run("UPDATE licenses SET machine_id = NULL WHERE key = ?", key);
       if (info.changes === 0) {
         return sendJson(res, 404, { error: "Key not found" });
       }
@@ -386,7 +491,7 @@ const server = http.createServer(async (req, res) => {
       const key = (body.key || "").trim().toUpperCase();
       if (!key) return sendJson(res, 400, { error: "Key is required" });
 
-      const info = db.prepare("DELETE FROM licenses WHERE key = ?").run(key);
+      const info = await db.run("DELETE FROM licenses WHERE key = ?", key);
       if (info.changes === 0) {
         return sendJson(res, 404, { error: "Key not found" });
       }
@@ -403,7 +508,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 401, { error: "Unauthorized admin access" });
       }
 
-      const rows = db.prepare("SELECT * FROM licenses ORDER BY id DESC").all();
+      const rows = await db.query("SELECT * FROM licenses ORDER BY id DESC");
       const licenses = rows.map((r) => {
         let perms = null;
         try { perms = JSON.parse(r.permissions || "{}"); } catch {}
@@ -436,7 +541,7 @@ const server = http.createServer(async (req, res) => {
       const key = (body.key || "").trim().toUpperCase();
       const permsStr = JSON.stringify(body.permissions || {});
 
-      db.prepare("UPDATE licenses SET permissions = ? WHERE key = ?").run(permsStr, key);
+      await db.run("UPDATE licenses SET permissions = ? WHERE key = ?", permsStr, key);
       return sendJson(res, 200, { success: true, message: `Permissions updated for ${key}` });
     }
 
@@ -445,9 +550,12 @@ const server = http.createServer(async (req, res) => {
     // GET /api/stats
     // ------------------------------------------------------------------------
     if (pathname === "/api/stats" && req.method === "GET") {
-      const total = db.prepare("SELECT COUNT(*) as count FROM licenses").get().count;
-      const active = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE is_active = 1").get().count;
-      const locked = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE machine_id IS NOT NULL AND machine_id != ''").get().count;
+      const totalRes = await db.get("SELECT COUNT(*) as count FROM licenses");
+      const activeRes = await db.get("SELECT COUNT(*) as count FROM licenses WHERE is_active = 1");
+      const lockedRes = await db.get("SELECT COUNT(*) as count FROM licenses WHERE machine_id IS NOT NULL AND machine_id != ''");
+      const total = totalRes?.count || 0;
+      const active = activeRes?.count || 0;
+      const locked = lockedRes?.count || 0;
       return sendJson(res, 200, { total, active, locked });
     }
 
